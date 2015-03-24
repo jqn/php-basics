@@ -1,0 +1,304 @@
+<?php
+/**
+ * @file fn_services.module
+ *
+ * Provides Services integration and associated cleanup.
+ */
+
+/**
+ * Implements hook_ctools_plugin_api().
+ */
+function fn_services_ctools_plugin_api($owner, $api) {
+  if ($owner == 'services' && $api == 'services') {
+    return array(
+      'version' => 3,
+      'file' => 'fn_services.services.inc'
+    );
+  }
+}
+
+/**
+ * Cleans up the search form to be sent over to the web app.
+ */
+function _fn_services_services_jsonify_form($form) {
+  // Fields we don't need at the app level.
+  $system_fields = array('form_id', 'form_build_id', 'form_token');
+  // Drop the reset button.
+  $system_fields[] = 'reset';
+
+  $children = element_children($form);
+  foreach ($form as $child => $child_item) {
+    if (in_array($child, $children) && !in_array($child, $system_fields)) {
+      $clone_form[$child] = _fn_services_clean_form_item($child_item);
+    }
+    else {
+      unset($clone_form[$child]);
+    }
+  }
+  return $clone_form;
+}
+
+/**
+ * Drops most of Drupal's form item attributes.
+ */
+function _fn_services_clean_form_item($item) {
+  $passthru = array(
+    'title' => '#title',
+    'type' => '#type',
+    'default_value' => '#default_value',
+  );
+
+  // Switch based off of type if it exists, otherwise use the theme.
+  $type = (!empty($item['#type'])) ? $item['#type'] : $item['#theme'];
+  switch ($type) {
+    case 'radios':
+      $passthru['options'] = '#options';
+      $cleaned = array(
+        'type' => 'radios',
+        'style' => 'controlgroup',
+      );
+      break;
+
+    case 'select':
+      $passthru['options'] = '#options';
+      // JS doesn't have a concept of objects which maintain an order of keys,
+      // this makes sure options keep their order, since JSON doesn't do arrays.
+      foreach ($item['#options'] as $key => $value) {
+        $options[] = array('key' => $key, 'value' => $value);
+      }
+      $item['#options'] = $options;
+      $cleaned['attributes'] = $item['#attributes'];
+      $cleaned['attributes']['class'][] = 'needsclick';
+      $cleaned['attributes']['class'] = implode(' ', $cleaned['attributes']['class']);
+      break;
+
+    case 'submit':
+      $passthru['value'] = '#value';
+      break;
+
+    case 'textfield':
+      $cleaned = array(
+        'title_placeholder' => TRUE,
+      );
+      break;
+
+    case 'link':
+      $passthru['text'] = '#text';
+      // The app show make this request in the background, not go to it.
+      $item['#options']['attributes']['data-request'] = $item['#path'];
+      $cleaned = array(
+        'attributes' => $item['#options']['attributes'],
+      );
+      break;
+
+  }
+
+  // A select list of information to passthru as is.
+  foreach ($passthru as $new_key => $drupal_key) {
+    // Allow passthru variables to be send to DrupalGap, but don't overwrite
+    // switch settings, and don't add non-existent information.
+    if (empty($cleaned[$new_key]) && !empty($item[$drupal_key])) {
+      $cleaned[$new_key] = $item[$drupal_key];
+    }
+  }
+
+  // Concatenate class arrays, as DrupalGap expects.
+  if (!empty($cleaned['attributes']['class']) && is_array($cleaned['attributes']['class'])) {
+    $cleaned['attributes']['class'] = implode(' ', $cleaned['attributes']['class']);
+  }
+
+  return $cleaned;
+}
+
+/**
+ * Implements hook_views_pre_render().
+ *
+ * Since DS code fields aren't available to views, rewrite the output
+ * of the inventory field to reflect the same output is is available from
+ * the custom field handler in fn_vouchers_quantity_available_text.
+ *
+ * Only fire on the services display of the consumer_view.
+ */
+function fn_services_views_pre_render(&$view) {
+  if ($view->name == 'consumer_views' && $view->current_display == 'services_json') {
+    foreach ($view->result as $key => $result) {
+      $inventory = $result->field_field_quantity_units_offered[0]['raw']['value'];
+      // Copied this code from fn_vouchers_num_claimed_by_offer().
+      // Not using the function as want to avoid node_load calls.
+      $query = db_select('vouchers', 'v')->fields('v', array('voucher_id'));
+      $query->condition('campaign_id', $result->nid, '=');
+      // Counting rows only.
+      $result = $query->countQuery()->execute();
+      $used = $result->fetchField();
+      $available = (int)$inventory - $used;
+      $message = 'Only !inventory Vouchers Remaining!';
+      $content = array();
+
+      if ($available > 0) {
+        $content = array(
+          '#markup' => t($message, array(
+            '!inventory' => '<span class="inventory-number">' . $available . '</span>'
+            )),
+          '#prefix' => '<div class="offer-inventory-message">',
+          '#suffix' => '</div>',
+        );
+      }
+      $view->result[$key]->field_field_quantity_units_offered[0]['rendered']['#markup'] = render($content);
+    }
+  }
+}
+
+
+/**
+ * Implements hook_services_request_postprocess_alter()
+ *
+ * Alter results of the services call.
+ *
+ * @param $controller
+ *   Controller definition
+ * @param array $args
+ *   Arguments passed to services callback
+ * @param array $result
+ *   Array of results that can be altered
+ *
+ * @see services_controller_execute()
+ * @see services.runtime.inc
+ */
+function fn_services_services_request_postprocess_alter($controller, $args, &$result) {
+  // We only want this to fire when loading a node of type offer.
+  if ($controller['callback'] == '_node_resource_retrieve' && $result->type == 'offer') {
+    // Build a dummy field array. Used to trick drupalgap into treating
+    // widgets as fields.
+    $field = array(
+      'entity' => $result,
+      'properties' => array(
+        'settings' => array(
+          'message_type' => 'long'
+        ),
+      ),
+    );
+
+    $ds_custom_fields = ds_get_field_settings('node', 'offer', 'drupalgap');
+    $ds_node_fields = ds_get_fields('node');
+
+    foreach($ds_custom_fields as $field_name => $settings) {
+      // Handling DS code fields.
+      if (isset($ds_node_fields[$field_name]['properties']['code'])) {
+        if ($ds_node_fields[$field_name]['properties']['code']['format'] == 'plain_text') {
+          $result->{$field_name}[LANGUAGE_NONE][0]['value'] = "<pre>".$ds_node_fields[$field_name]['properties']['code']['value']."</pre>";
+        }
+        else if ($ds_node_fields[$field_name]['properties']['code']['format'] != 'php_code') {
+          $result->{$field_name}[LANGUAGE_NONE][0]['value'] = $ds_node_fields[$field_name]['properties']['code']['value'];
+        }
+      }
+    }
+
+    // Build the values for the Quantity and Claim Button fields.
+    $quantity = fn_vouchers_quantity_available_text($field);
+    $claim = fn_vouchers_claim_offer_button($field, FALSE);
+    $claim = _fn_services_clean_claim_offer_button($claim, $result);
+
+    // Set the customized versions of the Quantity and Claim Button fields.
+    $result->quantity_available[LANGUAGE_NONE][0]['value'] = $quantity;
+    $result->claim_offer[LANGUAGE_NONE][0]['value'] = $claim;
+
+    // Build the Locations view field.
+    $offer_locations_view = views_get_view('offer_locations');
+    $offer_locations_view->set_display('block_3');
+    $offer_locations_view->set_arguments(array($result->nid));
+    $offer_locations_view->pre_execute();
+    $offer_locations_view->execute();
+
+    // Place the locations onto the embedded map.
+    foreach ($offer_locations_view->result as $key=>$row) {
+      $result->map_display_view[$key]['lat'] = $row->node_field_data_field_locations__location_latitude;
+      $result->map_display_view[$key]['lng'] = $row->node_field_data_field_locations__location_longitude;
+      $result->map_display_view[$key]['value'] = $row->node_field_data_field_locations__location_latitude . "_" . $row->node_field_data_field_locations__location_longitude;
+    }
+
+    // Set the drupalgap locations field to the prefiltered view.
+    $result->offer_locations_view[LANGUAGE_NONE][0]['value'] = views_embed_view('offer_locations', 'block_1', $result->nid);
+  }
+  elseif ($controller['callback'] == '_system_resource_connect') {
+    if (!empty($result->field_info_instances['node']['offer'])) {
+      $offer = &$result->field_info_instances['node']['offer'];
+
+      $ds_custom_fields = ds_get_field_settings('node', 'offer', 'drupalgap');
+      $ds_node_fields = ds_get_fields('node');
+
+      $view_config = ds_get_layout('node', 'offer', 'drupalgap');
+
+      foreach ($view_config['settings']['regions']['ds_content'] as $weight => $field_name) {
+        if (isset($offer[$field_name]) && is_array($offer[$field_name])) {
+          $offer[$field_name]['display']['drupalgap']['weight'] = $weight;
+        }
+        else {
+          $offer[$field_name]['display']['drupalgap'] = $ds_custom_fields[$field_name];
+          $offer[$field_name]['display']['drupalgap']['settings'] = array();
+          $offer[$field_name]['display']['drupalgap']['type'] = 'text';
+          $offer[$field_name]['display']['drupalgap']['module'] = 'text';
+          if (!empty($ds_node_fields[$field_name]['title'])) {
+            $offer[$field_name]['label'] = $ds_node_fields[$field_name]['title'];
+          }
+          $offer[$field_name]['function'] = $ds_node_fields[$field_name]['function'];
+          $offer[$field_name]['field_name'] = $field_name;
+        }
+      }
+
+      $offer['claim_offer']['display']['drupalgap']['module'] = 'claim_offer';
+      $offer['map_display_view']['display']['drupalgap']['module'] = 'map';
+    }
+    if (!empty($result->field_info_instances['user']['user'])) {
+      $user = &$result->field_info_instances['user']['user'];
+      $fields = &$result->field_info_fields;
+
+      object_log('services', func_get_args());
+    }
+  }
+}
+
+/**
+ * Convert renderable array into an array that will work for DrupalGap.
+ */
+function _fn_services_clean_claim_offer_button($claim_button, $node) {
+  $claim = $claim_button['claim_offer'];
+
+  $result = array(
+    'type' => 'claim_offer',
+    'attributes' => $claim['#attributes'],
+    // Just check if this user can claim one.
+    'reason' => fn_vouchers_can_claim_voucher($node, 1, TRUE, TRUE),
+  );
+
+  if (is_array($claim)) {
+    $children = element_children($claim);
+    foreach ($claim as $child => $child_item) {
+      if (in_array($child, $children)) {
+        $result[$child] = _fn_services_clean_form_item($child_item);
+      }
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_services_request_preprocess_alter()
+ *
+ * Allow to alter arguments before they are passed to service callback.
+ *
+ * @param $controller
+ *   Controller definition
+ * @param $args
+ *   Array of arguments
+ * @param $options
+ *
+ * @see services_controller_execute()
+ * @see services.runtime.inc
+ */
+function fn_services_services_request_preprocess_alter($controller, &$args, $options) {
+   // On login from App, set cookie lifetime to one year.
+  if ($controller['callback'] == 'drupalgap_email_registration_services_login') {
+    session_set_cookie_params(31556926);
+  }
+}
